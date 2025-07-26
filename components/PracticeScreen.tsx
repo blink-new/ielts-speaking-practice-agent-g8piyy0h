@@ -5,7 +5,8 @@ import {
   TouchableOpacity, 
   StyleSheet, 
   Alert,
-  Dimensions 
+  Dimensions,
+  ScrollView 
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Animated, { 
@@ -18,10 +19,9 @@ import Animated, {
   Easing
 } from 'react-native-reanimated';
 import { Ionicons } from '@expo/vector-icons';
-import { Audio } from 'expo-av';
 import { UserProfile } from '@/app/(tabs)/index';
 import { APP_CONFIG, ConversationState } from '@/constants/AppConfig';
-import ElevenLabsService from '@/services/ElevenLabsService';
+import ElevenLabsConversationService, { ConversationSession, ConversationMessage } from '@/services/ElevenLabsConversationService';
 
 interface PracticeScreenProps {
   userProfile: UserProfile;
@@ -35,10 +35,9 @@ const AVATAR_SIZE = width * APP_CONFIG.AVATAR_SIZE_RATIO;
 export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: PracticeScreenProps) {
   const [conversationState, setConversationState] = useState<ConversationState>('idle');
   const [isRecording, setIsRecording] = useState(false);
-  const [recording, setRecording] = useState<Audio.Recording | null>(null);
-  const [websocket, setWebsocket] = useState<WebSocket | null>(null);
+  const [currentSession, setCurrentSession] = useState<ConversationSession | null>(null);
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
-  const elevenLabsService = ElevenLabsService.getInstance();
 
   // Animation values
   const pulseAnimation = useSharedValue(0);
@@ -53,141 +52,57 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
       true
     );
 
-    // Initialize WebSocket connection
-    initializeWebSocket();
-
-    // Demo: Play welcome message after 2 seconds
-    setTimeout(() => {
-      if (userProfile.selectedVoice) {
-        playWelcomeMessage();
-      }
-    }, 2000);
+    // Initialize conversation session
+    initializeConversation();
 
     return () => {
-      if (websocket) {
-        websocket.close();
-      }
-      if (recording) {
-        recording.stopAndUnloadAsync();
-      }
+      // Cleanup on unmount
+      ElevenLabsConversationService.endConversation();
     };
   }, []);
 
-  const initializeWebSocket = () => {
+  const initializeConversation = async () => {
     try {
       setConnectionStatus('connecting');
-      const ws = new WebSocket(APP_CONFIG.WEBSOCKET_URL);
-      
-      ws.onopen = () => {
-        console.log('WebSocket connected');
-        setConnectionStatus('connected');
-        setWebsocket(ws);
-        
-        // Send initial user profile
-        ws.send(JSON.stringify({
-          type: 'user_profile',
-          data: userProfile
-        }));
-      };
+      setConversationState('processing');
 
-      ws.onmessage = (event) => {
-        const message = JSON.parse(event.data);
-        handleWebSocketMessage(message);
-      };
+      // Start conversation with ElevenLabs agent
+      const session = await ElevenLabsConversationService.startConversation({
+        name: userProfile.name,
+        targetBandScore: userProfile.targetBandScore,
+        testMode: userProfile.testMode,
+      });
 
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        setConnectionStatus('disconnected');
-      };
+      setCurrentSession(session);
+      setConnectionStatus('connected');
+      setConversationState('idle');
 
-      ws.onclose = () => {
-        console.log('WebSocket disconnected');
-        setConnectionStatus('disconnected');
-        setWebsocket(null);
-      };
-    } catch (error) {
-      console.error('Failed to initialize WebSocket:', error);
-      setConnectionStatus('disconnected');
-    }
-  };
-
-  const handleWebSocketMessage = (message: any) => {
-    switch (message.type) {
-      case 'agent_response':
-        setConversationState('speaking');
-        playAgentResponse(message.data.text);
-        break;
-      case 'listening':
-        setConversationState('listening');
-        break;
-      case 'processing':
-        setConversationState('processing');
-        break;
-      default:
-        console.log('Unknown message type:', message.type);
-    }
-  };
-
-  const playWelcomeMessage = async () => {
-    try {
-      if (!userProfile.selectedVoice) return;
-      
-      const welcomeText = await elevenLabsService.generateIELTSIntroduction(
-        userProfile.name, 
-        userProfile.selectedVoice
+      // Show welcome message
+      Alert.alert(
+        'Session Started',
+        `Your IELTS ${userProfile.testMode === 'examiner' ? 'Speaking Test' : 'Practice Session'} has begun. The examiner will speak first.`,
+        [{ text: 'Ready', onPress: () => setConversationState('listening') }]
       );
-      
-      if (welcomeText) {
-        setConversationState('speaking');
-        await elevenLabsService.playAudio(welcomeText);
-        setConversationState('idle');
-      }
-    } catch (error) {
-      console.error('Error playing welcome message:', error);
-    }
-  };
 
-  const playAgentResponse = async (text: string) => {
-    try {
-      if (!userProfile.selectedVoice) {
-        console.warn('No voice selected, using default');
-        return;
-      }
-
-      // Generate speech using ElevenLabs
-      const audioUri = await elevenLabsService.generateSpeech(text, userProfile.selectedVoice);
-      
-      if (audioUri) {
-        // Play the generated audio
-        await elevenLabsService.playAudio(audioUri);
-      }
-      
-      // Set state back to idle after playback
-      setConversationState('idle');
     } catch (error) {
-      console.error('Error playing agent response:', error);
+      console.error('Failed to initialize conversation:', error);
+      setConnectionStatus('disconnected');
       setConversationState('idle');
+      Alert.alert(
+        'Connection Error',
+        'Failed to connect to the IELTS examiner. Please check your internet connection and try again.',
+        [{ text: 'Retry', onPress: initializeConversation }]
+      );
     }
   };
 
   const startRecording = async () => {
+    if (!currentSession || conversationState !== 'idle') {
+      return;
+    }
+
     try {
-      const permission = await Audio.requestPermissionsAsync();
-      if (permission.status !== 'granted') {
-        Alert.alert('Permission Required', 'Please grant microphone permission to use this feature.');
-        return;
-      }
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const { recording: newRecording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
-      );
-
-      setRecording(newRecording);
+      await ElevenLabsConversationService.startRecording();
       setIsRecording(true);
       setConversationState('listening');
 
@@ -203,12 +118,14 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
 
     } catch (error) {
       console.error('Failed to start recording:', error);
-      Alert.alert('Recording Error', 'Failed to start recording. Please try again.');
+      Alert.alert('Recording Error', 'Failed to start recording. Please check microphone permissions.');
     }
   };
 
   const stopRecording = async () => {
-    if (!recording) return;
+    if (!isRecording || !currentSession) {
+      return;
+    }
 
     try {
       setIsRecording(false);
@@ -218,22 +135,49 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
       pulseAnimation.value = 0;
       microphoneScale.value = withTiming(1, { duration: 200 });
 
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
+      // Get recorded audio and send to agent
+      const audioUri = await ElevenLabsConversationService.stopRecording();
+      const agentMessage = await ElevenLabsConversationService.sendAudioMessage(audioUri);
 
-      if (uri && websocket && connectionStatus === 'connected') {
-        // In a real implementation, you would send the audio data to your server
-        websocket.send(JSON.stringify({
-          type: 'audio_data',
-          data: { uri, timestamp: Date.now() }
-        }));
-      }
+      // Update messages
+      const updatedMessages = ElevenLabsConversationService.getMessages();
+      setMessages(updatedMessages);
+
+      // Set state to speaking while agent responds
+      setConversationState('speaking');
+
+      // After agent finishes speaking, return to idle
+      setTimeout(() => {
+        setConversationState('idle');
+      }, 3000); // Adjust based on typical response length
 
     } catch (error) {
-      console.error('Failed to stop recording:', error);
+      console.error('Failed to process recording:', error);
       setConversationState('idle');
+      Alert.alert('Processing Error', 'Failed to process your response. Please try again.');
     }
+  };
+
+  const endSession = async () => {
+    Alert.alert(
+      'End Session',
+      'Are you sure you want to end this practice session?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { 
+          text: 'End Session', 
+          style: 'destructive',
+          onPress: async () => {
+            await ElevenLabsConversationService.endConversation();
+            setCurrentSession(null);
+            setMessages([]);
+            setConnectionStatus('disconnected');
+            setConversationState('idle');
+            onResetProfile();
+          }
+        }
+      ]
+    );
   };
 
   // Animated styles
@@ -268,13 +212,26 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
   const getStatusText = () => {
     switch (conversationState) {
       case 'listening':
-        return 'Listening...';
+        return 'Listening to your response...';
       case 'processing':
-        return 'Processing...';
+        return 'Processing your answer...';
       case 'speaking':
-        return 'Speaking...';
+        return 'Examiner is speaking...';
       default:
-        return 'Ready to practice';
+        return currentSession ? 'Ready for your response' : 'Connecting...';
+    }
+  };
+
+  const getAvatarIcon = () => {
+    switch (conversationState) {
+      case 'listening':
+        return 'mic';
+      case 'processing':
+        return 'hourglass';
+      case 'speaking':
+        return 'volume-high';
+      default:
+        return 'person';
     }
   };
 
@@ -285,8 +242,8 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
         entering={FadeInDown.duration(400)}
       >
         <View style={styles.headerTop}>
-          <TouchableOpacity style={styles.menuButton} onPress={onResetProfile}>
-            <Ionicons name="menu" size={24} color="#6B7280" />
+          <TouchableOpacity style={styles.menuButton} onPress={endSession}>
+            <Ionicons name="close" size={24} color="#6B7280" />
           </TouchableOpacity>
           
           <View style={[
@@ -295,19 +252,21 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
           ]}>
             <View style={styles.connectionDot} />
             <Text style={styles.connectionText}>
-              {connectionStatus === 'connected' ? 'Connected' : 'Offline'}
+              {connectionStatus === 'connected' ? 'Live Session' : 'Connecting...'}
             </Text>
           </View>
 
           <TouchableOpacity style={styles.voiceButton} onPress={onChangeVoice}>
-            <Ionicons name="person" size={24} color="#6B7280" />
+            <Ionicons name="settings" size={24} color="#6B7280" />
           </TouchableOpacity>
         </View>
 
-        <Text style={styles.greeting}>Hello, {userProfile.name}!</Text>
+        <Text style={styles.greeting}>
+          {userProfile.testMode === 'examiner' ? 'IELTS Speaking Test' : 'Practice Session'}
+        </Text>
         <Text style={styles.modeText}>
-          {userProfile.testMode === 'examiner' ? 'IELTS Speaking Test' : 'Practice Session'} • 
-          Target: {userProfile.targetBandScore}
+          {userProfile.name} • Target Band: {userProfile.targetBandScore} • 
+          Voice: {userProfile.selectedVoice || 'Default'}
         </Text>
       </Animated.View>
 
@@ -321,7 +280,7 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
             { backgroundColor: getAvatarColor() }
           ]}>
             <Ionicons 
-              name={conversationState === 'speaking' ? 'volume-high' : 'person'} 
+              name={getAvatarIcon()} 
               size={AVATAR_SIZE * 0.3} 
               color="#FFFFFF" 
             />
@@ -339,7 +298,11 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
           entering={FadeInDown.duration(600).delay(400)}
         >
           <Text style={styles.statusText}>{getStatusText()}</Text>
-          <Text style={styles.voiceText}>Voice: {userProfile.selectedVoice || 'Default'}</Text>
+          {currentSession && (
+            <Text style={styles.sessionInfo}>
+              Session ID: {currentSession.conversationId.slice(-8)}
+            </Text>
+          )}
         </Animated.View>
 
         <Animated.View 
@@ -350,10 +313,11 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
             <TouchableOpacity
               style={[
                 styles.microphoneButton,
-                isRecording && styles.microphoneButtonActive
+                isRecording && styles.microphoneButtonActive,
+                (conversationState === 'processing' || conversationState === 'speaking') && styles.microphoneButtonDisabled
               ]}
               onPress={isRecording ? stopRecording : startRecording}
-              disabled={conversationState === 'processing' || conversationState === 'speaking'}
+              disabled={!currentSession || conversationState === 'processing' || conversationState === 'speaking'}
             >
               <Ionicons 
                 name={isRecording ? "stop" : "mic"} 
@@ -364,9 +328,44 @@ export function PracticeScreen({ userProfile, onChangeVoice, onResetProfile }: P
           </Animated.View>
 
           <Text style={styles.microphoneHint}>
-            {isRecording ? 'Tap to stop recording' : 'Tap to start speaking'}
+            {!currentSession 
+              ? 'Connecting to examiner...'
+              : isRecording 
+                ? 'Tap to stop recording' 
+                : conversationState === 'speaking'
+                  ? 'Listen to the examiner'
+                  : conversationState === 'processing'
+                    ? 'Processing your response...'
+                    : 'Tap to start speaking'
+            }
           </Text>
         </Animated.View>
+
+        {/* Conversation History */}
+        {messages.length > 0 && (
+          <Animated.View 
+            style={styles.conversationHistory}
+            entering={FadeInDown.duration(600).delay(800)}
+          >
+            <Text style={styles.historyTitle}>Conversation</Text>
+            <ScrollView style={styles.messagesList} showsVerticalScrollIndicator={false}>
+              {messages.slice(-3).map((message) => (
+                <View 
+                  key={message.id} 
+                  style={[
+                    styles.messageItem,
+                    message.type === 'user' ? styles.userMessage : styles.agentMessage
+                  ]}
+                >
+                  <Text style={styles.messageType}>
+                    {message.type === 'user' ? 'You' : 'Examiner'}
+                  </Text>
+                  <Text style={styles.messageContent}>{message.content}</Text>
+                </View>
+              ))}
+            </ScrollView>
+          </Animated.View>
+        )}
       </View>
     </SafeAreaView>
   );
@@ -440,7 +439,7 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   modeText: {
-    fontSize: 16,
+    fontSize: 14,
     color: '#6B7280',
   },
   mainContent: {
@@ -484,17 +483,19 @@ const styles = StyleSheet.create({
     marginBottom: 48,
   },
   statusText: {
-    fontSize: 20,
+    fontSize: 18,
     fontWeight: '600',
     color: '#1F2937',
     marginBottom: 8,
+    textAlign: 'center',
   },
-  voiceText: {
-    fontSize: 14,
+  sessionInfo: {
+    fontSize: 12,
     color: '#6B7280',
   },
   controlsContainer: {
     alignItems: 'center',
+    marginBottom: 32,
   },
   microphoneButton: {
     width: 80,
@@ -514,9 +515,59 @@ const styles = StyleSheet.create({
     backgroundColor: APP_CONFIG.COLORS.ERROR,
     shadowColor: APP_CONFIG.COLORS.ERROR,
   },
+  microphoneButtonDisabled: {
+    backgroundColor: '#9CA3AF',
+    shadowColor: '#9CA3AF',
+  },
   microphoneHint: {
     fontSize: 14,
     color: '#6B7280',
     textAlign: 'center',
+    paddingHorizontal: 32,
+  },
+  conversationHistory: {
+    width: '100%',
+    maxHeight: 200,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  historyTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#1F2937',
+    marginBottom: 12,
+  },
+  messagesList: {
+    maxHeight: 120,
+  },
+  messageItem: {
+    marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
+  },
+  userMessage: {
+    backgroundColor: '#EBF4FF',
+    alignSelf: 'flex-end',
+  },
+  agentMessage: {
+    backgroundColor: '#F3F4F6',
+    alignSelf: 'flex-start',
+  },
+  messageType: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#6B7280',
+    marginBottom: 4,
+  },
+  messageContent: {
+    fontSize: 14,
+    color: '#1F2937',
+    lineHeight: 20,
   },
 });
